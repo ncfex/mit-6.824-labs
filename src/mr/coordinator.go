@@ -1,33 +1,145 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
+import (
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"sync"
+	"time"
+)
 
+type TaskStatus int
 
-type Coordinator struct {
-	// Your definitions here.
+const (
+	Idle TaskStatus = iota
+	InProgress
+	Completed
+)
 
+type Task struct {
+	ID        int
+	Type      string
+	File      string
+	Status    TaskStatus
+	StartTime time.Time
 }
 
-// Your code here -- RPC handlers for the worker to call.
+type Coordinator struct {
+	mu          sync.Mutex
+	mapTasks    []Task
+	reduceTasks []Task
+	nReduce     int
+	mapsDone    bool
+	done        bool
+}
 
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
+func MakeCoordinator(files []string, nReduce int) *Coordinator {
+	c := Coordinator{
+		nReduce:     nReduce,
+		mapTasks:    make([]Task, len(files)),
+		reduceTasks: make([]Task, nReduce),
+	}
+
+	for i, file := range files {
+		c.mapTasks[i] = Task{
+			ID:     i,
+			Type:   "map",
+			File:   file,
+			Status: Idle,
+		}
+	}
+
+	for i := 0; i < nReduce; i++ {
+		c.reduceTasks[i] = Task{
+			ID:     i,
+			Type:   "reduce",
+			Status: Idle,
+		}
+	}
+
+	c.server()
+	go c.checkTimeouts()
+
+	return &c
+}
+
+func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.mapsDone {
+		for i := range c.mapTasks {
+			if c.mapTasks[i].Status == Idle {
+				c.mapTasks[i].Status = InProgress
+				c.mapTasks[i].StartTime = time.Now()
+				reply.TaskType = "map"
+				reply.TaskID = i
+				reply.File = c.mapTasks[i].File
+				reply.NReduce = c.nReduce
+				return nil
+			}
+		}
+		reply.TaskType = "wait"
+		return nil
+	}
+
+	for i := range c.reduceTasks {
+		if c.reduceTasks[i].Status == Idle {
+			c.reduceTasks[i].Status = InProgress
+			c.reduceTasks[i].StartTime = time.Now()
+			reply.TaskType = "reduce"
+			reply.TaskID = i
+			reply.NReduce = c.nReduce
+			return nil
+		}
+	}
+
+	if c.done {
+		reply.TaskType = "done"
+	} else {
+		reply.TaskType = "wait"
+	}
 	return nil
 }
 
+func (c *Coordinator) TaskCompleted(args *TaskCompletedArgs, reply *TaskCompletedReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-//
+	if args.TaskType == "map" {
+		c.mapTasks[args.TaskID].Status = Completed
+		c.checkMapsDone()
+	} else if args.TaskType == "reduce" {
+		c.reduceTasks[args.TaskID].Status = Completed
+		c.checkReducesDone()
+	}
+
+	return nil
+}
+
+func (c *Coordinator) checkMapsDone() {
+	for _, task := range c.mapTasks {
+		if task.Status != Completed {
+			return
+		}
+	}
+
+	c.mapsDone = true
+}
+
+func (c *Coordinator) checkReducesDone() {
+	for _, task := range c.reduceTasks {
+		if task.Status != Completed {
+			return
+		}
+	}
+
+	c.done = true
+}
+
 // start a thread that listens for RPCs from worker.go
-//
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
@@ -41,30 +153,27 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
-//
-// main/mrcoordinator.go calls Done() periodically to find out
-// if the entire job has finished.
-//
 func (c *Coordinator) Done() bool {
-	ret := false
-
-	// Your code here.
-
-
-	return ret
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.done
 }
 
-//
-// create a Coordinator.
-// main/mrcoordinator.go calls this function.
-// nReduce is the number of reduce tasks to use.
-//
-func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
-
-	// Your code here.
-
-
-	c.server()
-	return &c
+func (c *Coordinator) checkTimeouts() {
+	for !c.Done() {
+		time.Sleep(10 * time.Second)
+		c.mu.Lock()
+		now := time.Now()
+		for i := range c.mapTasks {
+			if c.mapTasks[i].Status == InProgress && now.Sub(c.mapTasks[i].StartTime) > 10*time.Second {
+				c.mapTasks[i].Status = Idle
+			}
+		}
+		for i := range c.reduceTasks {
+			if c.reduceTasks[i].Status == InProgress && now.Sub(c.reduceTasks[i].StartTime) > 10*time.Second {
+				c.reduceTasks[i].Status = Idle
+			}
+		}
+		c.mu.Unlock()
+	}
 }
